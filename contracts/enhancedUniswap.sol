@@ -5,7 +5,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-contract EnhancedBasicUniswap is ERC20 {
+contract UpdatedBasicUniswap is ERC20 {
     error BasicUniswap__DeadlineHasPassed(uint64 deadline);
     error BasicUniswap__MaxPoolTokenDepositTooHigh(
         uint256 maximumPoolTokensToDeposit,
@@ -31,8 +31,12 @@ contract EnhancedBasicUniswap is ERC20 {
     IERC20 private immutable i_wethToken;
     IERC20 private immutable i_poolToken;
     uint256 private constant MINIMUM_WETH_LIQUIDITY = 1_000_000_000;
-    uint256 private swapCount = 0;
+    uint256 public constant MAX_LIQUIDITY = 1_000_000_000 * 1e18; // Example maximum cap set to 1 billion tokens
+    mapping(address => uint256) private userSwapCounts;
     uint256 private constant SWAP_COUNT_MAX = 10;
+
+    address public admin;
+    bool public paused;
 
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
@@ -59,14 +63,26 @@ contract EnhancedBasicUniswap is ERC20 {
                                MODIFIERS
     //////////////////////////////////////////////////////////////*/
     modifier revertIfDeadlinePassed(uint64 deadline) {
-        if (deadline == uint64(block.timestamp)) {
+        if (deadline < uint64(block.timestamp)) {
             revert BasicUniswap__DeadlineHasPassed(deadline);
         }
         _;
     }
 
     modifier revertIfZero(uint256 amount) {
-        require(amount > 0, "BasicUniswap__MustBeMoreThanZero");
+        if (amount == 0) {
+            revert BasicUniswap__MustBeMoreThanZero();
+        }
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!paused, "Contract is paused"); // Check if the contract is paused
+        _;
+    }
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Unauthorized access"); // Restrict function access to admin only
         _;
     }
 
@@ -81,6 +97,10 @@ contract EnhancedBasicUniswap is ERC20 {
     ) ERC20(liquidityTokenName, liquidityTokenSymbol) {
         i_wethToken = IERC20(wethToken);
         i_poolToken = IERC20(poolToken);
+        // Set the contract deployer as the admin
+        admin = msg.sender;
+        // Contract starts in active state
+        paused = false;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -95,14 +115,15 @@ contract EnhancedBasicUniswap is ERC20 {
     /// user is going to deposit, but set a minimum so they know approx what they will accept
     /// @param maximumPoolTokensToDeposit The maximum amount of pool tokens the user is willing to deposit, again it's
     /// derived from the amount of WETH the user is going to deposit
-    // / @param deadline The deadline for the transaction to be completed by
+    /// @param deadline The deadline for the transaction to be completed by
     function deposit(
         uint256 wethToDeposit,
         uint256 minimumLiquidityTokensToMint,
-        uint256 maximumPoolTokensToDeposit
+        uint256 maximumPoolTokensToDeposit,
+        uint64 deadline
     )
         external
-        // uint64 deadline    // UNUSED VARIABLE
+        revertIfDeadlinePassed(deadline)
         revertIfZero(wethToDeposit)
         returns (uint256 liquidityTokensToMint)
     {
@@ -114,7 +135,6 @@ contract EnhancedBasicUniswap is ERC20 {
         }
         if (totalLiquidityTokenSupply() > 0) {
             uint256 wethReserves = i_wethToken.balanceOf(address(this));
-            // uint256 poolTokenReserves = i_poolToken.balanceOf(address(this));  //UNUSED VAR
             // Our invariant says weth, poolTokens, and liquidity tokens must always have the same ratio after the
             // initial deposit
             // poolTokens / constant(k) = weth
@@ -176,6 +196,12 @@ contract EnhancedBasicUniswap is ERC20 {
         uint256 poolTokensToDeposit,
         uint256 liquidityTokensToMint
     ) private {
+        require(
+            totalLiquidityTokenSupply() + liquidityTokensToMint <=
+                MAX_LIQUIDITY,
+            "Exceeds maximum liquidity cap"
+        );
+
         _mint(msg.sender, liquidityTokensToMint);
         emit LiquidityAdded(msg.sender, poolTokensToDeposit, wethToDeposit);
 
@@ -278,7 +304,7 @@ contract EnhancedBasicUniswap is ERC20 {
         returns (uint256 inputAmount)
     {
         return
-            ((inputReserves * outputAmount) * 10000) /
+            ((inputReserves * outputAmount) * 1000) /
             ((outputReserves - outputAmount) * 997);
     }
 
@@ -289,13 +315,10 @@ contract EnhancedBasicUniswap is ERC20 {
         uint256 minOutputAmount,
         uint64 deadline
     )
-        external
+        public
         revertIfZero(inputAmount)
         revertIfDeadlinePassed(deadline)
-        returns (
-            //UNUSED VAR
-            uint256 output
-        )
+        returns (uint256 output)
     {
         uint256 inputReserves = inputToken.balanceOf(address(this));
         uint256 outputReserves = outputToken.balanceOf(address(this));
@@ -309,9 +332,8 @@ contract EnhancedBasicUniswap is ERC20 {
         if (outputAmount < minOutputAmount) {
             revert BasicUniswap__OutputTooLow(outputAmount, minOutputAmount);
         }
-
-        _swap(inputToken, inputAmount, outputToken, outputAmount);
         output = outputAmount;
+        _swap(inputToken, inputAmount, outputToken, outputAmount);
     }
 
     /*
@@ -329,6 +351,7 @@ contract EnhancedBasicUniswap is ERC20 {
         IERC20 inputToken,
         IERC20 outputToken,
         uint256 outputAmount,
+        uint256 maxInputAmount, // Added parameter for slippage protection
         uint64 deadline
     )
         public
@@ -345,6 +368,11 @@ contract EnhancedBasicUniswap is ERC20 {
             outputReserves
         );
 
+        require(
+            inputAmount <= maxInputAmount,
+            "Slippage protection: Input amount exceeds maximum"
+        );
+
         _swap(inputToken, inputAmount, outputToken, outputAmount);
     }
 
@@ -354,13 +382,15 @@ contract EnhancedBasicUniswap is ERC20 {
      * @return wethAmount amount of WETH received by caller
      */
     function sellPoolTokens(
-        uint256 poolTokenAmount
+        uint256 poolTokenAmount,
+        uint256 maxInputAmount
     ) external returns (uint256 wethAmount) {
         return
             swapExactOutput(
                 i_poolToken,
                 i_wethToken,
                 poolTokenAmount,
+                maxInputAmount,
                 uint64(block.timestamp)
             );
     }
@@ -388,12 +418,10 @@ contract EnhancedBasicUniswap is ERC20 {
             revert BasicUniswap__InvalidToken();
         }
 
-        // Update the state before making external calls
-        swapCount++;
-        if (swapCount >= SWAP_COUNT_MAX) {
-            swapCount = 0;
+        userSwapCounts[msg.sender]++;
+        if (userSwapCounts[msg.sender] >= SWAP_COUNT_MAX) {
+            userSwapCounts[msg.sender] = 0;
         }
-
         emit Swap(
             msg.sender,
             inputToken,
@@ -402,12 +430,9 @@ contract EnhancedBasicUniswap is ERC20 {
             outputAmount
         );
 
-        // Perform external calls after state updates
         inputToken.safeTransferFrom(msg.sender, address(this), inputAmount);
         outputToken.safeTransfer(msg.sender, outputAmount);
-
-        // Incentivize swapping after state updates
-        if (swapCount == 0) {
+        if (userSwapCounts[msg.sender] == 0) {
             outputToken.safeTransfer(msg.sender, 1_000_000_000_000_000_000);
         }
     }
@@ -463,5 +488,15 @@ contract EnhancedBasicUniswap is ERC20 {
                 i_poolToken.balanceOf(address(this)),
                 i_wethToken.balanceOf(address(this))
             );
+    }
+
+    // Pause the contract
+    function pauseContract() external onlyAdmin {
+        paused = true;
+    }
+
+    // Unpause the contract
+    function unpauseContract() external onlyAdmin {
+        paused = false;
     }
 }
